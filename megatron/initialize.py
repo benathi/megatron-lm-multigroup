@@ -84,12 +84,15 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
 
     # Parse args, build tokenizer, and set adlr-autoresume,
     # tensorboard-writer, and timers.
+    print("Start setting global variables")
     set_global_variables(extra_args_provider=extra_args_provider,
                          args_defaults=args_defaults,
                          ignore_unknown_args=ignore_unknown_args)
+    print("Done setting global variables")
 
     # torch.distributed initialization
     def finish_mpu_init():
+        print("@ finish mpu init function")
         args = get_args()
         # Pytorch distributed.
         _initialize_distributed()
@@ -141,19 +144,25 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
     if args.rank == 0:
         git_ds_info()
 
+    print(f"lazy mpu init = {args.lazy_mpu_init}")
+
     if  args.lazy_mpu_init:
         args.use_cpu_initialization=True
         # delayed initialization of DDP-related stuff
         # We only set basic DDP globals
+        print("Set tensor model parallel world size")
         set_tensor_model_parallel_world_size(args.tensor_model_parallel_size)
         # and return function for external DDP manager
         # to call when it has DDP initialized
+
+        print("Set tensor model parallel rank")
         set_tensor_model_parallel_rank(args.rank)
         return finish_mpu_init
     else:
         # Megatron's MPU is the master. Complete initialization right away.
         finish_mpu_init()
 
+        print("initializing memory buffers")
         # Initialize memory buffers.
         _initialize_mem_buffs()
 
@@ -266,8 +275,9 @@ def setup_deepspeed_random_and_activation_checkpointing(args):
 def _initialize_distributed():
     """Initialize torch.distributed and mpu."""
     args = get_args()
-
+    print("Initializing distributed")
     device_count = torch.cuda.device_count()
+    print("torch.distributed.is_initialized()", torch.distributed.is_initialized())
     if torch.distributed.is_initialized():
 
         if args.rank == 0:
@@ -290,6 +300,8 @@ def _initialize_distributed():
                 args.local_rank = device
             torch.cuda.set_device(device)
         # Call the init process
+        # TODO -- getting stuck here
+        print("deepspeed init: distributed backend", args.distributed_backend)
         deepspeed.init_distributed(args.distributed_backend)
 
     # Set the tensor model-parallel, pipeline model-parallel, and

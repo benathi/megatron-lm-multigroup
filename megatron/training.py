@@ -184,6 +184,7 @@ def pretrain(train_valid_test_dataset_provider,
     print_rank_0('training ...')
 
     iteration = 0
+    # BenA: -- this is an entire training loop but just
     if args.do_train and args.train_iters > 0:
         iteration = train(forward_step_func,
                           model, optimizer, lr_scheduler,
@@ -249,6 +250,8 @@ def get_model(model_provider_func):
     """Build the model."""
     args = get_args()
 
+    print(f"mpu.get_pipeline_model_parallel_world_size() = {mpu.get_pipeline_model_parallel_world_size()}")
+    print(f"args.virtual_pipeline_model_parallel_size = {args.virtual_pipeline_model_parallel_size}")
     # Build model.
     if mpu.get_pipeline_model_parallel_world_size() > 1 and \
        args.virtual_pipeline_model_parallel_size is not None:
@@ -314,6 +317,10 @@ def get_model(model_provider_func):
         return model
 
     if args.DDP_impl == 'local':
+        # both args.accumulate_allreduce_grads_in_fp32
+        # and args.use_contiguous_buffers_in_ddp have been set to true
+        # if this is the case of bf16 which requires accumulate_allreduce_grads_in_fp32 = True
+        # What is LocalDDP?
         model = [LocalDDP(model_module,
                           args.accumulate_allreduce_grads_in_fp32,
                           args.use_contiguous_buffers_in_ddp)
@@ -406,6 +413,7 @@ def setup_model_and_optimizer(model_provider_func):
         optimizer = None
         lr_scheduler = None
     else:
+        # this is not connected to deepspeed module yet
         optimizer = get_megatron_optimizer(unwrapped_model)
         lr_scheduler = get_learning_rate_scheduler(optimizer)
 
@@ -421,6 +429,7 @@ def setup_model_and_optimizer(model_provider_func):
         if args.universal_checkpoint:
             config["checkpoint"] = {"load_universal": True}
 
+        # BenA: this step gives deepspeed access to both model, optimizer, and lr scheduler
         model, optimizer, _, lr_scheduler = deepspeed.initialize(
             model=model[0],
             optimizer=optimizer,
@@ -503,7 +512,6 @@ def train_step(forward_step_func, data_iterator,
     """Single training step."""
     args = get_args()
     timers = get_timers()
-
     if args.deepspeed:
         assert isinstance(model[0], deepspeed.PipelineEngine), model
         loss = model[0].train_batch(data_iter=data_iterator)
@@ -512,6 +520,7 @@ def train_step(forward_step_func, data_iterator,
         num_zeros_in_grad = 0
         return {'lm loss' : loss}, skipped_iter, grad_norm, num_zeros_in_grad
 
+    # if deepspeed is used, nothing gets executed after this line for training
     # Set grad to zero.
     if not args.deepspeed:
         if args.DDP_impl == 'local' and args.use_contiguous_buffers_in_ddp:
@@ -521,7 +530,10 @@ def train_step(forward_step_func, data_iterator,
             optimizer.zero_grad()
 
     if mpu.get_pipeline_model_parallel_world_size() > 1:
+
         if args.virtual_pipeline_model_parallel_size is not None:
+            print("Doing forward backward pipeline with interleaving")
+            # this is not used because we're using deepspeed pipeline parallel instead
             forward_backward_func = forward_backward_pipelining_with_interleaving
             assert get_num_microbatches() % args.pipeline_model_parallel_size == 0, \
                 'number of microbatches is not divisible by pipeline-parallel ' \
@@ -767,6 +779,10 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         flops_per_iteration = (coefficient * checkpoint_activations_factor * batch_size * seq_len * num_layers * (hidden_size**2)) * (1. + (seq_len / (6. * hidden_size)) + (vocab_size / (16. * num_layers * hidden_size)))
         tflops = flops_per_iteration / (elapsed_time_per_iteration * args.world_size * (10**12))
 
+        memory_reserved = torch.cuda.max_memory_reserved() / (1024. ** 3)
+        memory_allocated = torch.cuda.max_memory_allocated() / (1024. ** 3)
+        time_remaining = (elapsed_time_per_iteration * (args.train_iters - iteration))/3600
+
         # only the last rank process has a non-None _GLOBAL_TENSORBOARD_WRITER
         if writer and is_last_rank():
             if args.log_timers_to_tensorboard:
@@ -821,10 +837,13 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             total_loss_dict[nan_iters_key])
         log_string += ' samples per second: {:.3f} |'.format(samples_per_sec)
         log_string += ' TFLOPs: {:.2f} |'.format(tflops)
+        log_string += ' Memory reserved: {:.2f} GB |'.format(memory_reserved)
+        #log_string += ' Memory allocated: {:.2f} GB |'.format(memory_allocated)
+        log_string += ' time remaining: {:.2f} hours |'.format(time_remaining)
         total_loss_dict[advanced_iters_key] = 0
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
-        print_rank_last(log_string)
+        print_rank_0(log_string)
         if report_memory_flag and learning_rate > 0.:
             # Report memory after optimizer state has been initialized.
             report_memory('(after {} iterations)'.format(iteration))
@@ -846,20 +865,19 @@ def save_checkpoint_and_time(iteration, model, optimizer, lr_scheduler):
     timers('save-checkpoint').stop()
     timers.log(['save-checkpoint'])
 
-
+# BenA: main function to do training loop
 def train(forward_step_func, model, optimizer, lr_scheduler,
           train_data_iterator, valid_data_iterator):
     """Train the model function."""
     args = get_args()
     timers = get_timers()
-
     if args.rank == 0:
         print("Number of parameters: [tensor rank - pipeline rank] w/ and w/o embeddings:")
     torch.distributed.barrier()
     if mpu.get_data_parallel_rank() == 0:
         tp_rank = mpu.get_tensor_model_parallel_rank()
         pp_rank = mpu.get_pipeline_model_parallel_rank()
-        preamble = f"[{tp_rank:0>3d}-{pp_rank:0>3d}]"
+        preamble = f"[TP_rank={tp_rank:0>3d}-PP_rank={pp_rank:0>3d}]"
         print(f"{preamble} {get_parameters_in_billions(model):.4f}B / {get_parameters_in_billions(model, exclude_embeddings=True):.4f}B", flush=True)
         torch.distributed.barrier()
     else:
@@ -877,7 +895,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
     total_loss_dict = {}
 
     # Iterations.
-    iteration = args.iteration
+    iteration = args.iteration # TODO - is this loaded from the previous checkpoint?
 
     timers('interval-time').start()
     print_datetime('before the start of training step')
@@ -913,6 +931,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
             print_datetime(f"Detected kill switch at {args.kill_switch_path}. Exiting")
             sys.exit()
 
+        # BenA: this is the training loop
         update_num_microbatches(args.consumed_train_samples)
         if args.deepspeed:
             # inform deepspeed of any batch size changes
@@ -945,7 +964,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
 
         # Logging.
         loss_scale = None
-        if args.fp16:
+        if args.fp16 or args.bf16:
             if args.deepspeed:
                 loss_scale = model[0].optimizer.cur_scale
             else:
@@ -1130,9 +1149,10 @@ def evaluate_and_print_results(prefix, forward_step_func,
                                   ppl, args.gigaflos_no_embeds)
 
     length = len(string) + 1
-    print_rank_last('-' * length)
-    print_rank_last(string)
-    print_rank_last('-' * length)
+    # do it for rank 0
+    print_rank_0('-' * length)
+    print_rank_0(string)
+    print_rank_0('-' * length)
 
 
 def cyclic_iter(iter):

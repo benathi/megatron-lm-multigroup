@@ -33,7 +33,7 @@ from megatron.model.fused_layer_norm import MixedFusedLayerNorm as LayerNorm
 from megatron.model.module import float16_to_fp32
 from .language_model import EmbeddingPipe
 from .transformer import ParallelTransformerLayerPipe
-
+# ParallelTransformerLayerPipe is the main class
 
 def post_language_model_processing(lm_output, labels, logit_weights,
                                    get_key_value, parallel_output,
@@ -206,10 +206,11 @@ class GPTModelPipe(PipelineModule,MegatronModule):
     ):
         args = get_args()
         self.parallel_output = parallel_output
+        # BenA: meaning?
 
         init_method = init_method_normal(args.init_method_std)
 
-        self.specs = []
+        self.specs = [] # what are the specs?
 
         def _to_float16(inputs):
             if args.fp16:
@@ -225,13 +226,15 @@ class GPTModelPipe(PipelineModule,MegatronModule):
         self.specs.append(TiedLayerSpec('embed',
                                         EmbeddingPipe,
                                         args.hidden_size,
-                                        args.padded_vocab_size,
+                                        args.padded_vocab_size, # requires knowledge from tokenizer
                                         args.hidden_dropout,
                                         init_method=init_method,
                                         num_tokentypes=num_tokentypes,
                                         tied_weight_attr='word_embeddings_weight'))
 
+        # BenA: what's the significance of this flag? residual has full precision?
         if args.fp32_residual_connection:
+            # BenA: which setting is pretrain_causal_attention = False?
             if getattr(args, 'pretrain_causal_attention', False):
                 self.specs.append(lambda x: x.transpose(0, 1).contiguous().float())
             else:
@@ -244,6 +247,8 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                 # EmbeddingPipe returns attention mask as well
                 self.specs.append(lambda x: (x[0].transpose(0, 1).contiguous(), *x[1:]))
 
+        # Layer number is simply 0 to num_layers - 1 (no other complexity like in ParallelTransformer class)
+        # This is using deepspeed pipeline module
         for layer_idx in range(args.num_layers):
             self.specs.append(
                 LayerSpec(ParallelTransformerLayerPipe,
@@ -295,6 +300,7 @@ class GPTModelPipe(PipelineModule,MegatronModule):
         else:
             interval = 0
 
+        # BenA notes: for MP, this step needs to be explicit
         from deepspeed.runtime.pipe.topology import PipeModelDataParallelTopology
         topo = PipeModelDataParallelTopology(num_pp=mpu.get_pipeline_model_parallel_world_size(),
                                              num_mp=mpu.get_tensor_model_parallel_world_size(),
@@ -311,6 +317,7 @@ class GPTModelPipe(PipelineModule,MegatronModule):
             partition_method = args.pp_partition_method
         else:
             partition_method = 'type:transformer'
+            # balance the transformer layer per stage
 
         super().__init__(layers=self.specs,
                          loss_fn=get_cross_entropy(is_prefix=attn_mask_type is AttnMaskType.prefix),

@@ -343,6 +343,8 @@ class TransformerLanguageModel(MegatronModule):
             self._embedding_key = 'embedding'
 
         # Transformer.
+        # For GPT2, this is the same as Decoder as long as the mask type is causal
+        # no additionl decoder to be added in the next step (self.add_decoder)
         self.encoder = ParallelTransformer(
             self.init_method,
             output_layer_init_method,

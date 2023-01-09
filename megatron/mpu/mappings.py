@@ -34,7 +34,10 @@ def _reduce(input_):
 
 def _split(input_):
     """Split the tensor along its last dimension and keep the
-    corresponding slice."""
+    corresponding slice.
+
+    BenA: note -- keep the slice corresponding to the TP rank
+    """
 
     world_size = get_tensor_model_parallel_world_size()
     # Bypass the function if we are using only 1 GPU.
@@ -140,6 +143,9 @@ class _GatherFromModelParallelRegion(torch.autograd.Function):
 # -----------------
 # Helper functions.
 # -----------------
+# BenA: notes -- all these functions are built in to torch without MP
+# with MP, we have to be careful about which group / which rank etc.
+# hence the wrappers
 
 def copy_to_tensor_model_parallel_region(input_):
     return _CopyToModelParallelRegion.apply(input_)

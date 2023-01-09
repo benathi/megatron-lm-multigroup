@@ -84,7 +84,12 @@ class Encoder(object):
             text = data[key]
             doc_ids = []
             for sentence in Encoder.splitter.tokenize(text):
-                sentence_ids = Encoder.tokenizer.tokenize(sentence)
+                if self.args.tokenizer_type == "VectorTokenizer":
+                    # for HF based tokenizers, tokenizer.tokenize gets tokens rather than token ids
+                    sentence_ids = Encoder.tokenizer.encode(sentence)
+                else:
+                    sentence_ids = Encoder.tokenizer.tokenize(sentence)
+                #print(f"sentence = {sentence}\nsentence ids=\n{sentence_ids}")
                 if len(sentence_ids) > 0:
                     doc_ids.append(sentence_ids)
             if len(doc_ids) > 0 and self.args.append_eod:
@@ -109,7 +114,8 @@ def get_args():
     group = parser.add_argument_group(title='tokenizer')
     group.add_argument('--tokenizer-type', type=str, required=True,
                        choices=['BertWordPieceLowerCase','BertWordPieceCase',
-                                'GPT2BPETokenizer', 'PretrainedFromHF'],
+                                'GPT2BPETokenizer', 'PretrainedFromHF',
+                                'VectorTokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--vocab-file', type=str, default=None,
                        help='Path to the vocab file')

@@ -29,7 +29,7 @@ def build_tokenizer(args):
               flush=True)
 
     # Select and instantiate the tokenizer.
-    assert args.vocab_file is not None or args.tokenizer_type == "PretrainedFromHF"
+    assert args.vocab_file is not None or args.tokenizer_type in ["PretrainedFromHF"]
     if args.tokenizer_type == 'BertWordPieceLowerCase':
         tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
                                             lower_case=True,
@@ -41,6 +41,9 @@ def build_tokenizer(args):
     elif args.tokenizer_type == 'GPT2BPETokenizer':
         assert args.merge_file is not None
         tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file)
+        # tokenizer.vocab_size = 50257
+        # padded_vocab_size = 51200
+        # print("GPT2 tokenizer eod", tokenizer.eod) # 50256
     elif args.tokenizer_type == "PretrainedFromHF":
         assert args.tokenizer_name_or_path is not None
 
@@ -56,7 +59,6 @@ def build_tokenizer(args):
         if args.rank == 0:
             print(" vocab file is un-used. loading tokenizer from pre-trained model")
         tokenizer = _AutoTokenizer(args.tokenizer_name_or_path, vocab_extra_ids=args.vocab_extra_ids)
-    else:
         raise NotImplementedError('{} tokenizer is not '
                                   'implemented.'.format(args.tokenizer_type))
 

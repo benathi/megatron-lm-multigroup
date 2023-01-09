@@ -329,7 +329,9 @@ class ColumnParallelLinear(torch.nn.Module):
 
 
     def forward(self, input_):
-        # Set up backprop all-reduce.
+        # Set up backprop all-reduce
+        # BenA: in input is copied during forward. This is because model parallel shares input within the group
+        # grads are reduced during backward
         input_parallel = copy_to_tensor_model_parallel_region(input_)
         # Matrix multiply.
 
@@ -337,6 +339,9 @@ class ColumnParallelLinear(torch.nn.Module):
         output_parallel = F.linear(input_parallel, self.weight, bias)
         if self.gather_output:
             # All-gather across the partitions.
+            # BenA (gather = concat)
+            # for QKV projections, do we need to concat at this step since different heads work orthogonally?
+            # answer: no. this argument is False for QKV projection -- this makes sense
             output = gather_from_tensor_model_parallel_region(output_parallel)
         else:
             output = output_parallel

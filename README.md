@@ -1,3 +1,5 @@
+## Note: This is a fork of bigscience-workshop/Megatron-DeepSpeed with implementation of multigroup attention
+
 # What is this fork of Megatron-LM and Megatron-DeepSpeed
 
 This is a detached fork of https://github.com/microsoft/Megatron-DeepSpeed, which in itself is a fork of https://github.com/NVIDIA/Megatron-LM. The former integrates DeepSpeed into the original Megatron-LM code.

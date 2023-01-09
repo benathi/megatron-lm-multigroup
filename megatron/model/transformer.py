@@ -123,7 +123,8 @@ class ParallelAttention(MegatronModule):
     def __init__(self, init_method,
                  output_layer_init_method, layer_number,
                  attention_type=AttnType.self_attn,
-                 attn_mask_type=AttnMaskType.padding):
+                 attn_mask_type=AttnMaskType.padding,
+                 use_sparse_attention=False):
         super(ParallelAttention, self).__init__()
         args = get_args()
         self.fp16 = args.fp16
@@ -142,6 +143,7 @@ class ParallelAttention(MegatronModule):
 
         # Per attention head and per partition values.
         world_size = mpu.get_tensor_model_parallel_world_size()
+        self.tp_num_groups = world_size
         self.hidden_size_per_partition = mpu.divide(projection_size,
                                                     world_size)
         self.hidden_size_per_attention_head = mpu.divide(
@@ -149,13 +151,36 @@ class ParallelAttention(MegatronModule):
         self.num_attention_heads_per_partition = mpu.divide(
             args.num_attention_heads, world_size)
 
+        # BenA
+        self.multi_group = args.multi_group
+        self.einsum = args.einsum
+        self.head_dim = self.hidden_size_per_attention_head
+        assert self.multi_group % self.tp_num_groups == 0, f"Num groups must {self.multi_group} be divisible by the tensor parallel world size {self.tp_num_groups}"
+        self.num_group_per_partition = self.multi_group // self.tp_num_groups
+        self.scale_during_fused_softmax = args.scale_during_fused_softmax
+
         # Strided linear layer.
         if attention_type == AttnType.self_attn:
+            # TODO -- multi group here
+            # everything multiplied by k (args.kv_channels or head dimension)
+            # multi head: query | key | value -> h | h | h -> after tensor parallel -> h/p | h/p | h/p
+            # multi group:  query | key | value -> h | g | g -> after tensor parallel -> h/p | g/p | g/p
+            # multi head -> multi group : 3*h/p -> (h + 2*g)/p
+            if self.multi_group == 0:
+                output_dim_before_shard = 3 * projection_size
+            else:
+                assert self.multi_group % self.tp_num_groups == 0, f"num groups {self.multi_group} not divisible by world size {self.tp_num_groups}"
+                output_dim_before_shard = args.kv_channels * (args.num_attention_heads + 2 * self.multi_group)
+            # ColumnParallelLinear TP shard the output
             self.query_key_value = mpu.ColumnParallelLinear(
                 args.hidden_size,
-                3 * projection_size,
+                output_dim_before_shard,
                 gather_output=False,
                 init_method=init_method)
+            # self.query_key_value is a function ColumnParallelLinear()
+            # controls how things are splitted according to MP rank
+            # Note: gather output = False since different heads can work orthogonally
+            # ColumnParallelLinear is a general function that works when we want gather as well
         else:
             assert attention_type == AttnType.cross_attn
             self.query = mpu.ColumnParallelLinear(
@@ -175,24 +200,37 @@ class ParallelAttention(MegatronModule):
         if self.apply_query_key_layer_scaling:
             coeff = self.layer_number
             self.norm_factor *= coeff
+        if self.scale_during_fused_softmax:
+            coeff /= self.norm_factor
 
+        self.use_sparse_attention = use_sparse_attention
+        local_window_sparse = args.local_window_sparse if self.use_sparse_attention else 0
+
+        # BenA: fused computation for masked softmax to make it more compute bound
+        # when self.apply_query_key_layer_scaling = True, layer_number is multiplied back in FusedScaleMaskSoftmax
         self.scale_mask_softmax = FusedScaleMaskSoftmax(
             self.fp16, self.bf16,
-            self.attn_mask_type,
-            args.masked_softmax_fusion,
-            attention_mask_func,
+            self.attn_mask_type, # AttnMaskType.causal
+            args.masked_softmax_fusion, # True
+            attention_mask_func, # a predefined function
             self.attention_softmax_in_fp32,
-            coeff)
+            coeff,
+            local_window_sparse=local_window_sparse)
 
         # Dropout. Note that for a single iteration, this layer will generate
         # different outputs on different number of parallel partitions but
         # on average it should not be partition dependent.
-        self.attention_dropout = torch.nn.Dropout(args.attention_dropout)
+        if args.attention_dropout > 0:
+            self.attention_dropout = torch.nn.Dropout(args.attention_dropout)
+        else:
+            self.attention_dropout = None
 
         # Output.
+        # BenA: output = <context, P_O> | bn (h/p)v, (h/p)v d -> bnd
+        # note that input_is_parallel is true which does not require the input to be scattered
         self.dense = mpu.RowParallelLinear(
-            projection_size,
-            args.hidden_size,
+            projection_size, # input size
+            args.hidden_size, # output size
             input_is_parallel=True,
             init_method=output_layer_init_method,
             skip_bias_add=True)
@@ -215,18 +253,42 @@ class ParallelAttention(MegatronModule):
 
         if self.attention_type == AttnType.self_attn:
             # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
+
+            # Note: sq, b, d -> [feedforward layer for each MP degree] -> sq, b, h/p * k for query, key, value
+            # normally with p=1, this would be sq,b,d -> sq,b,d 3 copies, but with mp, d = hk is splitted
+            # so self.query_key_value is the linear layer essentially, but written under MPU
             mixed_x_layer, _ = self.query_key_value(hidden_states)
-
+            """
+            Ben's note:
+            # np = h/p
+            # hn = d/h = k
+            # 3 h/p k -> h/p, 3 * k -> [h/p,k] , [h/p,k], [h/p,k]
+            # three parts for query, key, value
+            """
             # [sq, b, (np * 3 * hn)] --> [sq, b, np, 3 * hn]
-            new_tensor_shape = mixed_x_layer.size()[:-1] + \
-                (self.num_attention_heads_per_partition,
-                 3 * self.hidden_size_per_attention_head)
-            mixed_x_layer = mixed_x_layer.view(*new_tensor_shape)
+            if self.multi_group == 0:
+                new_tensor_shape = mixed_x_layer.size()[:-1] + \
+                    (self.num_attention_heads_per_partition,
+                     3 * self.head_dim)
+                mixed_x_layer = mixed_x_layer.view(*new_tensor_shape)
 
-            # [sq, b, np, 3 * hn] --> 3 [sq, b, np, hn]
-            (query_layer,
-             key_layer,
-             value_layer) = mpu.split_tensor_along_last_dim(mixed_x_layer, 3)
+                # [sq, b, np, 3 * hn] --> 3 [sq, b, np, hn]
+                (query_layer,
+                 key_layer,
+                 value_layer) = mpu.split_tensor_along_last_dim(mixed_x_layer, 3)
+            else:
+                # multi head: [n, b, (h/p * 3 * k)]
+                # multi group: [n, b, (h/p + 2 * g/p * k)]
+                # split into           h/p * k , g/p * k, g/p * k
+                assert mixed_x_layer.size()[-1] == (self.hidden_size_per_partition + 2 * self.num_group_per_partition * self.head_dim)
+                sizes = (self.hidden_size_per_partition, self.hidden_size_per_partition + self.head_dim * self.num_group_per_partition)
+                (query_layer,
+                 key_layer,
+                 value_layer) = torch.tensor_split(mixed_x_layer, sizes, dim=-1)
+                # [m, b, g/p * k] --> [m, b, g/p, k]
+                key_layer = key_layer.view(key_layer.size()[:-1] + (self.num_group_per_partition, self.head_dim))
+                value_layer = value_layer.view(value_layer.size()[:-1] + (self.num_group_per_partition, self.head_dim))
+                query_layer = query_layer.view(query_layer.size()[:-1] + (self.num_attention_heads_per_partition, self.head_dim))
         else:
             # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
             mixed_kv_layer, _ = self.key_value(encoder_output)
@@ -266,17 +328,25 @@ class ParallelAttention(MegatronModule):
         # Raw attention scores. [b, np, s, s]
         # ===================================
 
-        # [b, np, sq, sk]
+        # [b, np, sq, sk] or bhnm
         output_size = (query_layer.size(1),
                        query_layer.size(2),
                        query_layer.size(0),
                        key_layer.size(0))
 
+        b, h_per_p, n, m = output_size
+        k = self.head_dim
+        assert h_per_p == self.num_attention_heads_per_partition
+
         # [sq, b, np, hn] -> [sq, b * np, hn]
-        query_layer = query_layer.view(output_size[2],
-                                       output_size[0] * output_size[1], -1)
-        # [sk, b, np, hn] -> [sk, b * np, hn]
-        key_layer = key_layer.view(output_size[3],
+        #query_layer = query_layer.view(output_size[2],
+        #                               output_size[0] * output_size[1], -1)
+        if self.multi_group == 0:
+            query_layer = query_layer.view(n, b * self.num_attention_heads_per_partition, -1)
+
+        if self.multi_group == 0:
+            # [sk, b, np, hn] -> [sk, b * np, hn]
+            key_layer = key_layer.view(output_size[3],
                                    output_size[0] * output_size[1], -1)
 
         # preallocting result tensor: [b * np, sq, sk]
@@ -304,11 +374,35 @@ class ParallelAttention(MegatronModule):
 
         # Raw attention scores. [b * np, sq, sk]
         if alibi is None:
-            matmul_result = torch.baddbmm(
-                matmul_result,
-                query_layer.transpose(0, 1),   # [b * np, sq, hn]
-                key_layer.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
-                beta=0.0, alpha=(1.0/self.norm_factor))
+            # BenA: <q,K>
+            # TODO -- multi group here
+            if self.multi_group > 0:
+                if self.einsum:
+                    # incoming shape of query  is nbhk
+                    # shape and transpose it into b gp n k where h = g*p and g = self.multi_group / tp_size
+                    # [n, b * h/p, k]
+                    assert self.num_attention_heads_per_partition % self.num_group_per_partition == 0
+                    query_layer = query_layer.view(
+                        n, b, self.num_group_per_partition, self.num_attention_heads_per_partition // self.num_group_per_partition, k
+                    )
+                    if not self.scale_during_fused_softmax:
+                        matmul_result = torch.einsum("nbgrk,mbgk->bgrnm", query_layer, key_layer) / self.norm_factor
+                    else:
+                        matmul_result = torch.einsum("nbgrk,mbgk->bgrnm", query_layer, key_layer)
+                    # change shape to Bnm where B = bgr
+                    matmul_result = matmul_result.view(b*self.num_attention_heads_per_partition, n, m)
+                else:
+                    assert False, "Not supported for now"
+            else:
+                if self.einsum:
+                    # Ben A: B = bh (h here is h/p already)
+                    matmul_result = torch.einsum('nBk,mBk->Bnm', query_layer, key_layer) / self.norm_factor
+                else:
+                    matmul_result = torch.baddbmm(
+                        matmul_result,
+                        query_layer.transpose(0, 1),   # [b * np, sq, hn] | np = h/p
+                        key_layer.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
+                        beta=0.0, alpha=(1.0/self.norm_factor))
         else:
             if not hasattr(self, "logged_alibi"):
                 logger.debug("Using Alibi.")
@@ -330,7 +424,8 @@ class ParallelAttention(MegatronModule):
         # ==================================================
         # Update attention mask for inference. [b, np, sq, sk]
         # ==================================================
-
+        # BenA: for training, get_key_value = False.
+        # attention_mask is None | "Mask is silently ignored due to the use of a custom kernel", see FusedScaleMaskSoftmax.forward_fused_softmax()
         if get_key_value:
             with torch.no_grad():
                 # TODO @thomasw21 Handle case where `attention_mask` is None
@@ -349,6 +444,7 @@ class ParallelAttention(MegatronModule):
         # Attention probs and dropout
         # ===========================
 
+        # BenA: this is the fused part of softmax + attention mask
         # attention scores and attention mask [b, np, sq, sk]
         attention_probs = self.scale_mask_softmax(attention_scores,
                                                   attention_mask)
@@ -356,7 +452,8 @@ class ParallelAttention(MegatronModule):
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
         with mpu.get_cuda_rng_tracker().fork():
-            attention_probs = self.attention_dropout(attention_probs)
+            if self.attention_dropout is not None:
+                attention_probs = self.attention_dropout(attention_probs)
 
         # =========================
         # Context layer. [sq, b, hp]
@@ -366,21 +463,39 @@ class ParallelAttention(MegatronModule):
         # [sk, b, np, hn] --> [b, np, sq, hn]
 
         # context layer shape: [b, np, sq, hn]
-        output_size = (value_layer.size(1),
-                       value_layer.size(2),
-                       query_layer.size(0),
-                       value_layer.size(3))
+        #output_size = (value_layer.size(1),
+        #               value_layer.size(2),
+        #               query_layer.size(0),
+        #               value_layer.size(3))
+        output_size = (b, self.num_attention_heads_per_partition, n, k)
 
         # change view [sk, b * np, hn]
-        value_layer = value_layer.view(value_layer.size(0),
-                                       output_size[0] * output_size[1], -1)
+        if self.multi_group == 0:
+            #value_layer = value_layer.view(value_layer.size(0),
+            #                           output_size[0] * output_size[1], -1)
+            value_layer = value_layer.view(m, b * self.num_attention_heads_per_partition, -1)
 
         # change view [b * np, sq, sk]
-        attention_probs = attention_probs.view(output_size[0] * output_size[1],
-                                               output_size[2], -1)
+        #attention_probs = attention_probs.view(output_size[0] * output_size[1],
+        #                                       output_size[2], -1)
+        attention_probs = attention_probs.view(b * self.num_attention_heads_per_partition, n, m)
 
-        # matmul: [b * np, sq, hn]
-        context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
+        # TODO -- add multi group here
+        if self.multi_group > 0:
+            if self.einsum:
+                attention_probs = attention_probs.view(
+                    b, self.num_group_per_partition, self.num_attention_heads_per_partition // self.num_group_per_partition, n, m
+                )
+                context_layer = torch.einsum("bgpnm,mbgv->bgpnv", attention_probs, value_layer)
+            else:
+                assert False, "Not supported for now"
+        else:
+            if self.einsum:
+                # B = bh
+                context_layer = torch.einsum('Bnm,Bmv->Bnv', attention_probs, value_layer.transpose(0, 1))
+            else:
+                # matmul: [b * np, sq, hn]
+                context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
 
         # change view [b, np, sq, hn]
         context_layer = context_layer.view(*output_size)
@@ -397,6 +512,7 @@ class ParallelAttention(MegatronModule):
         # Output. [sq, b, h]
         # =================
 
+        # BenA: self.dense is also an MPU function (RowParallelLinear)
         output, bias = self.dense(context_layer)
 
         if get_key_value:
@@ -439,12 +555,13 @@ class ParallelTransformerLayer(MegatronModule):
 
     def __init__(self, init_method, output_layer_init_method,
                  layer_number, layer_type=LayerType.encoder,
-                 self_attn_mask_type=AttnMaskType.padding):
+                 self_attn_mask_type=AttnMaskType.padding,
+                 ):
         args = get_args()
 
         super(ParallelTransformerLayer, self).__init__()
         self.layer_number = layer_number
-        self.layer_type = layer_type
+        self.layer_type = layer_type # to support encoder decoder
 
         self.apply_residual_connection_post_layernorm \
             = args.apply_residual_connection_post_layernorm
@@ -457,13 +574,23 @@ class ParallelTransformerLayer(MegatronModule):
             args.hidden_size,
             eps=args.layernorm_epsilon)
 
+        sparse_attention_type = args.sparse_attention # alternate, full, none
+        if sparse_attention_type == 'full':
+            use_sparse_attention = True
+        elif sparse_attention_type == 'alternate' and layer_number % 2 == 1:
+            use_sparse_attention = True
+        else:
+            use_sparse_attention = False
+
         # Self attention.
         self.self_attention = ParallelAttention(
             init_method,
             output_layer_init_method,
             layer_number,
             attention_type=AttnType.self_attn,
-            attn_mask_type=self_attn_mask_type)
+            attn_mask_type=self_attn_mask_type,
+            use_sparse_attention=use_sparse_attention
+        )
         self.hidden_dropout = args.hidden_dropout
         self.bias_dropout_fusion = args.bias_dropout_fusion
 
@@ -647,7 +774,7 @@ class ParallelTransformerLayerPipe(ParallelTransformerLayer):
         else:
             raise RuntimeError('Received more inputs than understood.')
 
-
+# when is this class used?
 class ParallelTransformer(MegatronModule):
     """Transformer class."""
 

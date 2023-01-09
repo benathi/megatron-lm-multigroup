@@ -39,7 +39,10 @@ def scaled_init_method_normal(sigma, num_layers):
 
     return init_
 
-
+# BenA
+# this function gets attention score, and mask things out with attention mask
+# attention_scores are passed from attention computation before softmax
+# this function is used only in the non fused version
 def attention_mask_func(attention_scores, attention_mask):
     args = get_args()
     if args.curriculum_learning:

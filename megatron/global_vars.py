@@ -90,9 +90,11 @@ def set_global_variables(extra_args_provider=None, args_defaults={},
     args = _parse_args(extra_args_provider=extra_args_provider,
                        defaults=args_defaults,
                        ignore_unknown_args=ignore_unknown_args)
+    # tokenizer_type
     _build_num_microbatches_calculator(args)
     if args.vocab_file or args.tokenizer_name_or_path:
         _ = _build_tokenizer(args)
+
     _set_tensorboard_writer(args)
     _set_codecarbon_tracker(args)
     _set_adlr_autoresume(args)

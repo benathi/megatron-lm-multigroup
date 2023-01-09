@@ -17,6 +17,7 @@ from functools import lru_cache
 import torch
 import torch.nn as nn
 from megatron.enums import AttnMaskType
+from megatron import get_args
 
 class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function):
     """
@@ -29,6 +30,7 @@ class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function):
     @staticmethod
     def forward(ctx, inputs, scale):
         import scaled_upper_triang_masked_softmax_cuda
+        # from: fused_kernels/build/scaled_upper_triang_masked_softmax_cuda.so
 
         scale_t = torch.tensor([scale])
         softmax_results = scaled_upper_triang_masked_softmax_cuda.forward(
@@ -134,8 +136,10 @@ class FusedScaleMaskSoftmax(nn.Module):
         mask_func,
         softmax_in_fp32,
         scale,
+        local_window_sparse=0,
     ):
         super(FusedScaleMaskSoftmax, self).__init__()
+        self.args = get_args()
         self.input_in_fp16 = input_in_fp16
         self.input_in_bf16 = input_in_bf16
         assert not (
@@ -147,6 +151,8 @@ class FusedScaleMaskSoftmax(nn.Module):
         self.mask_func = mask_func
         self.softmax_in_fp32 = softmax_in_fp32
         self.scale = scale
+        self.local_window_sparse = local_window_sparse
+        self.attention_mask = self.get_causal_mask(self.args.max_position_embeddings, self.local_window_sparse)
 
         assert (
             self.scale is None or softmax_in_fp32
@@ -190,6 +196,10 @@ class FusedScaleMaskSoftmax(nn.Module):
             assert sq == sk, "causal mask is only for self attention"
             assert mask is None, "Mask is silently ignored due to the use of a custom kernel"
 
+            # for sparse, one way is to mask the input here. a different version would be truly fused
+            if self.local_window_sparse > 0:
+                input = input.masked_fill_(self.attention_mask[:,:,:sq,:sk], torch.finfo(input.dtype).min)
+
             # input is 3D tensor (attn_batches, sq, sk)
             input = input.view(-1, sq, sk)
             probs = ScaledUpperTriangMaskedSoftmax.apply(input, scale)
@@ -203,9 +213,14 @@ class FusedScaleMaskSoftmax(nn.Module):
 
     @staticmethod
     @lru_cache(maxsize=1)
-    def get_causal_mask(sequence_length: int):
+    def get_causal_mask(sequence_length: int, local_window_sparse: int):
         mask = torch.ones(1, 1, sequence_length, sequence_length, dtype=torch.bool, device=torch.cuda.current_device())
-        return torch.triu(mask, diagonal=1)
+        mask = torch.triu(mask, diagonal=1)
+        # note: megatron uses True value for upper triangular excluding diagonal
+        # the True position will be filled with negative values (-100000. for example)
+        if local_window_sparse > 0:
+            mask = torch.bitwise_xor(mask, torch.tril(mask == False, -local_window_sparse))
+        return mask
 
     def forward_torch_softmax(self, input, mask):
         if self.input_in_float16 and self.softmax_in_fp32:
@@ -217,7 +232,7 @@ class FusedScaleMaskSoftmax(nn.Module):
         if self.attn_mask_type == AttnMaskType.causal:
             assert mask is None
             assert input.shape[2] == input.shape[3]
-            mask = self.get_causal_mask(input.shape[2])
+            mask = self.get_causal_mask(input.shape[2], self.local_window_sparse)
 
         mask_output = self.mask_func(input, mask) if mask is not None else input
 

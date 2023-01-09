@@ -31,6 +31,7 @@ from megatron.logging import log_levels
 
 def parse_args(extra_args_provider=None, defaults={},
                ignore_unknown_args=False):
+    print("@parse_args in arguments.py")
     """Parse all arguments."""
     parser = argparse.ArgumentParser(description='Megatron-LM Arguments',
                                      allow_abbrev=False)
@@ -418,6 +419,16 @@ def _add_network_size_args(parser):
     group.add_argument('--log-level-replica', type=str, choices=list(log_levels.keys()),
                        help="Logger log level to use on replicas. Same choices as ``log_level``"
                        )
+    group.add_argument('--multi-group', type=int, default=0,
+                       help="0 for multi-head, 1 for multi-query, and >1 for multi group, up to num head per tp")
+    group.add_argument('--einsum', action='store_true',
+                       help="Whether to use einsum for attention operation")
+    group.add_argument('--local-window-sparse', type=int, default=0,
+                       help='The window size for local window sparsity')
+    group.add_argument('--sparse-attention', type=str, choices=['none', 'alternate', 'full'],
+                       help='Sparsity type')
+    group.add_argument('--scale-during-fused-softmax', action='store_true',
+                       help="scale the attention scores during fused softmax")
     return parser
 
 
@@ -592,7 +603,7 @@ def _add_initialization_args(parser):
                        'distribution used for weight initialization.')
     group.add_argument('--init-method-xavier-uniform', action='store_true',
                        help='Enable Xavier uniform parameter initialization')
-
+    # add muP later
     return parser
 
 
@@ -668,6 +679,8 @@ def _add_checkpointing_args(parser):
                        help='Load model for finetuning. Do not load optimizer '
                        'or rng state from checkpoint and set iteration to 0. '
                        'Assumed when loading a release checkpoint.')
+    group.add_argument('--keep_last_k', type=int, default=5,
+                       help="Keeping only last k")
 
     return parser
 
@@ -912,7 +925,9 @@ def _add_data_args(parser):
                        choices=['BertWordPieceLowerCase',
                                 'BertWordPieceCase',
                                 'GPT2BPETokenizer',
-                                'PretrainedFromHF'],
+                                'PretrainedFromHF',
+                                'VectorTokenizer',
+                                ],
                        help='What type of tokenizer to use.')
     group.add_argument("--tokenizer-name-or-path", type=str, default=None,
                        help="Name or path of the huggingface tokenizer.")

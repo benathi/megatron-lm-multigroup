@@ -19,7 +19,8 @@ import os
 import random
 import sys
 import numpy as np
-
+import glob
+import shutil
 import torch
 
 from megatron.global_vars import codecarbon_tracker_flush
@@ -112,6 +113,13 @@ def get_checkpoint_tracker_filename(checkpoints_path):
     return os.path.join(checkpoints_path, 'latest_checkpointed_iteration.txt')
 
 
+def clean_dir_rank_0(dirpath):
+    if torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0:
+            print("Removing", dirpath)
+            shutil.rmtree(dirpath)
+
+
 def save_checkpoint(iteration, model, optimizer, lr_scheduler):
     """Save a model checkpoint."""
     args = get_args()
@@ -165,9 +173,21 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
             ensure_directory_exists(checkpoint_name)
             torch.save(state_dict, checkpoint_name)
 
+
     if args.deepspeed:
         # Saving is a collective communication
         checkpoint_name = get_checkpoint_name(args.save, iteration)
+        # checkpoint_name = dirpath/global_stepxxx/zero_pp_rank_x_mp_rank_xx_optim.states.pt
+        base_dirname = "/".join(checkpoint_name.split("/")[:-3])
+        pattern = os.path.join(base_dirname, "global_step*")
+        # find all directories matching this pattern
+        dirpaths = glob.glob(pattern)
+        # sort by step number
+        dirpaths_to_remove = sorted(dirpaths, key=lambda x: int(x[len(pattern)-1:]))[:-args.keep_last_k]
+        print("About to remove ", dirpaths_to_remove)
+        for dirpath in dirpaths_to_remove:
+            clean_dir_rank_0(dirpath)
+
         # Trim off the filename and mp_rank_* directory.
         for _ in range(3):
             checkpoint_name = os.path.dirname(checkpoint_name)
